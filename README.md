@@ -1,5 +1,7 @@
 ## libbbs-rs
 
+[![Rust](https://github.com/ilumary/libbbs-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/ilumary/libbbs-rs/actions/workflows/rust.yml)
+
 An implementation of BBS Signatures in pure Rust, following [draft-irtf-cfrg-bbs-signatures-09](https://datatracker.ietf.org/doc/draft-irtf-cfrg-bbs-signatures/).
 
 libbbs-rs provides an implementation of pairing-based BBS signatures, enabling signing multiple messages with a single signature and zero-knowledge proofs of possession with selective disclosure of messages.
