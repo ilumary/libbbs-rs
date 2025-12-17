@@ -8,6 +8,8 @@ use rand_core::RngCore;
 use sha2::Sha256;
 use sha3::Shake256;
 
+// (de)serialization stuff
+
 macro_rules! serialize_g1 {
     ($buf:expr, $off:expr, $point:expr) => {
         $buf[$off..$off + 48].copy_from_slice(&$point.to_compressed());
@@ -30,10 +32,32 @@ macro_rules! serialize_u64 {
     };
 }
 
+macro_rules! deserialize_g1 {
+    ($buf:expr, $off:expr) => {{
+        let point = G1Affine::from_compressed($buf[$off..$off + 48].try_into().unwrap()).unwrap();
+        $off += 48;
+        point
+    }};
+}
+
+macro_rules! deserialize_scalar {
+    ($buf:expr, $off:expr) => {{
+        let mut bytes: [u8; 32] = $buf[$off..$off + 32].try_into().unwrap();
+        bytes.reverse();
+        let scalar = Scalar::from_bytes(&bytes).unwrap();
+        $off += 32;
+        scalar
+    }};
+}
+
+// constants
+
 const EXPAND_LEN: usize = 48;
 
 const OCTET_SCALAR_LENGTH: usize = 32;
+const OCTET_POINT_LENGTH: usize = 48;
 
+/// holds all required cipher suite specific values and functions
 pub struct CipherSuite {
     pub api_id: &'static [u8],
 
@@ -45,6 +69,8 @@ pub struct CipherSuite {
 
     pub compare_pairing: fn(bilinear_maps: &[(&G1Affine, &G2Prepared)], result: &Gt) -> bool,
 }
+
+// cipher suites
 
 pub const BLS12_381_G1_XOF_SHAKE_256: CipherSuite = CipherSuite {
     api_id: b"BBS_BLS12381G1_XOF:SHAKE-256_SSWU_RO_",
@@ -59,7 +85,7 @@ pub const BLS12_381_G1_XOF_SHAKE_256: CipherSuite = CipherSuite {
         ExpandMsgXof::<Shake256>::init_expand(msg, dst, len.unwrap_or(EXPAND_LEN)).into_vec()
     },
     hash_to_curve_g1: |msg: &[u8], dst: &[u8]| {
-        assert!(dst.len() <= 255, "DST too long");
+        assert!(dst.len() <= 255, "dst too long");
         <G1Projective as HashToCurve<ExpandMsgXof<Shake256>>>::hash_to_curve(msg, dst).into()
     },
     compare_pairing: |bilinear_maps: &[(&G1Affine, &G2Prepared)], result: &Gt| {
@@ -88,17 +114,200 @@ pub const BLS12_381_G1_XMD_SHA_256: CipherSuite = CipherSuite {
     },
 };
 
-//TODO make signature type
+// internal types
+
+struct Proof {
+    abar: G1Affine,
+    bbar: G1Affine,
+    d: G1Affine,
+    eh: Scalar,
+    r1h: Scalar,
+    r3h: Scalar,
+    mh: Vec<Scalar>,
+    c: Scalar,
+}
+
+struct InitRes {
+    g1: [G1Affine; 5],
+    sc: Scalar,
+}
+
+// impls
 
 pub fn proof_verify(
+    cs: &CipherSuite,
     pk: &[u8],
-    proof: &mut [u8],
+    proof: &[u8],
     header: Option<&[u8]>,
     ph: Option<&[u8]>,
-    disclosed_messages: &[&[u8]],
-    disclosed_indexes: Option<Vec<u64>>,
+    disclosed_messages: Option<&[&[u8]]>,
+    disclosed_indexes: Option<Vec<usize>>,
 ) -> bool {
-    false
+    let disclosed_messages = disclosed_messages.unwrap_or_default();
+    let api_id = [cs.api_id, b"H2G_HM2S_"].concat();
+
+    let r = disclosed_messages.len();
+
+    let proof_len_floor = 3 * OCTET_POINT_LENGTH + 4 * OCTET_SCALAR_LENGTH;
+    assert!(proof.len() >= proof_len_floor);
+    let u = (proof.len() - proof_len_floor) / OCTET_SCALAR_LENGTH;
+
+    let disclosed_message_scalars = messages_to_scalars(cs, disclosed_messages, Some(&api_id));
+    let generators = create_generators(cs, u + r + 1, Some(&api_id));
+
+    core_proof_verify(
+        cs,
+        pk,
+        proof,
+        &generators,
+        header,
+        ph,
+        &disclosed_message_scalars,
+        &disclosed_indexes.unwrap_or_default(),
+        Some(&api_id),
+    )
+}
+
+fn core_proof_verify(
+    cs: &CipherSuite,
+    pk: &[u8],
+    proof: &[u8],
+    generators: &[G1Affine],
+    header: Option<&[u8]>,
+    ph: Option<&[u8]>,
+    disclosed_messages: &[Scalar],
+    disclosed_indexes: &[usize],
+    api_id: Option<&[u8]>,
+) -> bool {
+    let api_id = api_id.unwrap_or(&[]);
+    let ph = ph.unwrap_or(&[]);
+
+    let proof = octets_to_proof(proof);
+    let w = G2Affine::from_compressed(pk.try_into().unwrap()).unwrap();
+
+    let init_res = prepare_proof_verify(
+        cs,
+        pk,
+        &proof,
+        generators,
+        header,
+        disclosed_messages,
+        &disclosed_indexes,
+        Some(api_id),
+    );
+
+    let c = proof_challenge_calculate(
+        cs,
+        disclosed_messages,
+        disclosed_indexes,
+        Some(api_id),
+        ph,
+        &init_res,
+    );
+
+    if c != proof.c {
+        return false;
+    }
+
+    (cs.compare_pairing)(
+        &[
+            (&proof.abar, &G2Prepared::from(w)),
+            (&proof.bbar, &G2Prepared::from(-G2Affine::generator())),
+        ],
+        &Gt::identity(),
+    )
+}
+
+fn prepare_proof_verify(
+    cs: &CipherSuite,
+    pk: &[u8],
+    proof: &Proof,
+    generators: &[G1Affine],
+    header: Option<&[u8]>,
+    disclosed_messages: &[Scalar],
+    disclosed_indexes: &[usize],
+    api_id: Option<&[u8]>,
+) -> InitRes {
+    let u = proof.mh.len();
+    let r = disclosed_indexes.len();
+    let l = r + u;
+
+    disclosed_indexes.iter().for_each(|&i| {
+        assert!(i < l);
+    });
+
+    assert!(
+        disclosed_messages.len() == r,
+        "wrong number of disclosed messages"
+    );
+    assert!(generators.len() == l + 1, "wrong number of generators");
+
+    let q1 = generators[0];
+    let hp = &generators[1..];
+
+    let disclosed_indexes_set = disclosed_indexes
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let undisclosed_indexes: Vec<usize> = (0..l)
+        .filter(|i| !disclosed_indexes_set.contains(i))
+        .collect();
+
+    let domain = calculate_domain(cs, pk, &q1, hp, header, api_id);
+    let t1 = proof.bbar * proof.c + proof.abar * proof.eh + proof.d * proof.r1h;
+    let p1: G1Affine = G1Affine::from_compressed(&cs.p1).unwrap();
+    let bv: G1Projective = disclosed_indexes
+        .iter()
+        .zip(disclosed_messages.iter())
+        .fold(p1 + q1 * domain, |acc: G1Projective, (&i, &msg)| {
+            acc + hp[i] * msg
+        });
+
+    let t2: G1Projective = undisclosed_indexes.iter().zip(proof.mh.iter()).fold(
+        bv * proof.c + proof.d * proof.r3h,
+        |acc: G1Projective, (&j, &m)| acc + hp[j] * m,
+    );
+
+    InitRes {
+        g1: [proof.abar, proof.bbar, proof.d, t1.into(), t2.into()],
+        sc: domain,
+    }
+}
+
+fn octets_to_proof(proof: &[u8]) -> Proof {
+    let mut off = 0;
+
+    let abar = deserialize_g1!(proof, off);
+    let bbar = deserialize_g1!(proof, off);
+    let d = deserialize_g1!(proof, off);
+
+    let eh = deserialize_scalar!(proof, off);
+    let r1h = deserialize_scalar!(proof, off);
+    let r3h = deserialize_scalar!(proof, off);
+
+    let remaining = proof.len() - off;
+    let num_scalars = remaining / 32;
+
+    let mh = if num_scalars > 1 {
+        (0..num_scalars - 1)
+            .map(|_| deserialize_scalar!(proof, off))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let c = deserialize_scalar!(proof, off);
+    assert!(off == proof.len());
+
+    Proof {
+        abar,
+        bbar,
+        d,
+        eh,
+        r1h,
+        r3h,
+        mh,
+        c,
+    }
 }
 
 pub fn proof_gen(
@@ -123,9 +332,7 @@ pub fn proof_gen(
     let l = messages.len();
 
     for &i in disclosed_indexes.iter() {
-        if i >= l {
-            panic!("disclosed index out of bounds");
-        }
+        assert!(i < l, "disclosed indexes out of bounds");
     }
 
     let undisclosed_indexes = (0..l)
@@ -137,7 +344,7 @@ pub fn proof_gen(
 
     let random_scalars = calculate_random_scalars(5 + u);
 
-    let (abar, bbar, d, t1, t2, domain) = proof_init(
+    let init_res = proof_init(
         cs,
         pk,
         (&a, &e),
@@ -152,15 +359,10 @@ pub fn proof_gen(
     let challenge = proof_challenge_calculate(
         cs,
         &message_scalars,
-        disclosed_indexes,
+        &disclosed_indexes,
         Some(&api_id),
         ph,
-        &abar,
-        &bbar,
-        &d,
-        &t1,
-        &t2,
-        &domain,
+        &init_res,
     );
 
     // proof finalize
@@ -168,9 +370,9 @@ pub fn proof_gen(
         &random_scalars,
         &message_scalars,
         &undisclosed_indexes,
-        &abar,
-        &bbar,
-        &d,
+        &init_res.g1[0],
+        &init_res.g1[1],
+        &init_res.g1[2],
         &e,
         &challenge,
     )
@@ -233,15 +435,10 @@ fn proof_finalize(
 fn proof_challenge_calculate(
     cs: &CipherSuite,
     messages: &[Scalar],
-    disclosed_indexes: Vec<usize>,
+    disclosed_indexes: &[usize],
     api_id: Option<&[u8]>,
     ph: &[u8],
-    abar: &G1Affine,
-    bbar: &G1Affine,
-    d: &G1Affine,
-    t1: &G1Affine,
-    t2: &G1Affine,
-    domain: &Scalar,
+    ir: &InitRes,
 ) -> Scalar {
     let api_id = api_id.unwrap_or(&[]);
 
@@ -268,12 +465,12 @@ fn proof_challenge_calculate(
         serialize_scalar!(c_octs, off, messages[di]);
     });
 
-    serialize_g1!(c_octs, off, abar);
-    serialize_g1!(c_octs, off, bbar);
-    serialize_g1!(c_octs, off, d);
-    serialize_g1!(c_octs, off, t1);
-    serialize_g1!(c_octs, off, t2);
-    serialize_scalar!(c_octs, off, domain);
+    serialize_g1!(c_octs, off, ir.g1[0]);
+    serialize_g1!(c_octs, off, ir.g1[1]);
+    serialize_g1!(c_octs, off, ir.g1[2]);
+    serialize_g1!(c_octs, off, ir.g1[3]);
+    serialize_g1!(c_octs, off, ir.g1[4]);
+    serialize_scalar!(c_octs, off, ir.sc);
 
     serialize_u64!(c_octs, off, ph.len());
     c_octs[off..].copy_from_slice(ph);
@@ -293,7 +490,7 @@ fn proof_init(
     message_scalars: &[Scalar],
     random_scalars: &[Scalar],
     undisclosed_indexes: &[usize],
-) -> (G1Affine, G1Affine, G1Affine, G1Affine, G1Affine, Scalar) {
+) -> InitRes {
     let header = header.unwrap_or(&[]);
     let api_id = api_id.unwrap_or(&[]);
     let (a, e) = signature;
@@ -332,14 +529,10 @@ fn proof_init(
         .zip(mt.iter())
         .fold(d * r3t, |acc: G1Projective, (&j, &m)| acc + h[j] * m);
 
-    (
-        abar.into(),
-        bbar.into(),
-        d.into(),
-        t1.into(),
-        t2.into(),
-        domain,
-    )
+    InitRes {
+        g1: [abar.into(), bbar.into(), d.into(), t1.into(), t2.into()],
+        sc: domain,
+    }
 }
 
 pub fn verify(
@@ -390,7 +583,7 @@ pub fn verify(
 
 pub fn sign(
     cs: &CipherSuite,
-    sk: Scalar,
+    sk: &[u8],
     pk: &[u8],
     header: Option<&[u8]>,
     messages: &[&[u8]],
@@ -411,6 +604,9 @@ pub fn sign(
     );
     let q_1 = generators[0];
     let h = &generators[1..];
+
+    let mut sk_off = 0;
+    let sk = deserialize_scalar!(sk, sk_off);
 
     let domain = calculate_domain(cs, pk, &q_1, h, Some(header), Some(&api_id));
 
@@ -617,13 +813,128 @@ fn hash_to_scalar(cs: &CipherSuite, msg_octets: &[u8], dst: &[u8]) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use std::fs;
+    use std::path::Path;
 
-    // test function used to convert big endian byte arrays into little endian and then Scalars
+    // convert big endian byte arrays into little endian and then scalars
     fn bytes_be_to_scalar(bytes: &[u8; 32]) -> Scalar {
         let mut tmp = [0u8; 64];
         tmp[32..].copy_from_slice(bytes);
         tmp.reverse();
         Scalar::from_bytes_wide(&tmp)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SignerKeyPair {
+        public_key: String,
+        secret_key: String,
+    }
+
+    #[derive(Deserialize)]
+    struct TestResult {
+        valid: bool,
+        reason: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TestVector {
+        case_name: String,
+        signer_key_pair: SignerKeyPair,
+        header: String,
+        messages: Vec<String>,
+        signature: String,
+        result: TestResult,
+    }
+
+    fn run_signature_test<F>(path: &Path, verify_fn: F)
+    where
+        F: Fn(&[u8], &[u8], &[u8], &[u8], &[&[u8]]) -> bool,
+    {
+        let json_content = fs::read_to_string(path).expect("failed to read file");
+
+        let vector: TestVector = serde_json::from_str(&json_content).expect("failed to parse json");
+
+        let pk_bytes = hex::decode(&vector.signer_key_pair.public_key).unwrap();
+        let sk_bytes = hex::decode(&vector.signer_key_pair.secret_key).unwrap();
+        let header_bytes = hex::decode(&vector.header).unwrap();
+        let sig_bytes = hex::decode(&vector.signature).unwrap();
+        let msg_bytes: Vec<Vec<u8>> = vector
+            .messages
+            .iter()
+            .map(|m| hex::decode(m).expect("invalid hex in messages"))
+            .collect();
+        let msg_slices: Vec<&[u8]> = msg_bytes.iter().map(|m| m.as_slice()).collect();
+
+        let is_valid = verify_fn(&pk_bytes, &sk_bytes, &header_bytes, &sig_bytes, &msg_slices);
+
+        assert_eq!(
+            is_valid,
+            vector.result.valid,
+            "test case '{}' failed in file {:?} with reason {}",
+            vector.case_name,
+            path.file_name().unwrap(),
+            vector.result.reason.unwrap_or_default()
+        );
+    }
+
+    fn run_signature_test_vectors_in_dir<F>(dir_path: &str, verify_fn: F)
+    where
+        F: Fn(&[u8], &[u8], &[u8], &[u8], &[&[u8]]) -> bool + Copy,
+    {
+        let paths = fs::read_dir(dir_path).expect("could not find directory");
+
+        for entry in paths {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                run_signature_test(&path, verify_fn);
+            }
+        }
+    }
+
+    #[test]
+    fn bls12_381_sha_256_signatures() {
+        run_signature_test_vectors_in_dir(
+            "./test_fixtures/bls12-381-sha-256/signature",
+            |pk, sk, header, sig, msgs| {
+                let signature = sign(&BLS12_381_G1_XMD_SHA_256, sk, pk, Some(header), msgs);
+                if sig != signature {
+                    return false;
+                }
+
+                verify(
+                    &BLS12_381_G1_XMD_SHA_256,
+                    pk,
+                    &signature,
+                    Some(header),
+                    msgs,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn bls12_381_shake_256_signatures() {
+        run_signature_test_vectors_in_dir(
+            "./test_fixtures/bls12-381-shake-256/signature",
+            |pk, sk, header, sig, msgs| {
+                let signature = sign(&BLS12_381_G1_XOF_SHAKE_256, sk, pk, Some(header), msgs);
+                if sig != signature {
+                    return false;
+                }
+
+                verify(
+                    &BLS12_381_G1_XOF_SHAKE_256,
+                    pk,
+                    &signature,
+                    Some(header),
+                    msgs,
+                )
+            },
+        );
     }
 
     pub const M1: &[u8] = &[
@@ -762,16 +1073,14 @@ mod tests {
         let l = messages.len();
 
         for &i in disclosed_indexes.iter() {
-            if i >= l {
-                panic!("disclosed index out of bounds");
-            }
+            assert!(i < l, "disclosed indexes out of bounds");
         }
 
         let undisclosed_indexes = (0..l)
             .filter(|i| !disclosed_indexes.contains(i))
             .collect::<Vec<usize>>();
 
-        let (abar, bbar, d, t1, t2, domain) = proof_init(
+        let init_res = proof_init(
             &cs,
             &pk,
             (&a, &e),
@@ -806,29 +1115,24 @@ mod tests {
         let challenge = proof_challenge_calculate(
             &cs,
             &message_scalars,
-            disclosed_indexes.to_vec(),
+            &disclosed_indexes,
             Some(&api_id),
             &ph,
-            &abar,
-            &bbar,
-            &d,
-            &t1,
-            &t2,
-            &domain,
+            &init_res,
         );
 
-        assert_eq!(domain, expected_domain);
-        assert_eq!(t1, expected_t1);
-        assert_eq!(t2, expected_t2);
+        assert_eq!(init_res.sc, expected_domain);
+        assert_eq!(init_res.g1[3], expected_t1);
+        assert_eq!(init_res.g1[4], expected_t2);
 
         // proof finalize
         let proof = proof_finalize(
             &random_scalars,
             &message_scalars,
             &undisclosed_indexes,
-            &abar,
-            &bbar,
-            &d,
+            &init_res.g1[0],
+            &init_res.g1[1],
+            &init_res.g1[2],
             &e,
             &challenge,
         );
@@ -857,110 +1161,16 @@ mod tests {
         ];
 
         assert_eq!(*proof, expected_proof);
-    }
 
-    #[test]
-    fn bls12_381_sha256_sign_multi_message() {
-        let cs = BLS12_381_G1_XMD_SHA_256;
-
-        let sk = bytes_be_to_scalar(&[
-            0x60, 0xe5, 0x51, 0x10, 0xf7, 0x68, 0x83, 0xa1, 0x3d, 0x03, 0x0b, 0x2f, 0x6b, 0xd1,
-            0x18, 0x83, 0x42, 0x2d, 0x5a, 0xbd, 0xe7, 0x17, 0x56, 0x9f, 0xc0, 0x73, 0x1f, 0x51,
-            0x23, 0x71, 0x69, 0xfc,
-        ]);
-
-        let pk = [
-            0xa8, 0x20, 0xf2, 0x30, 0xf6, 0xae, 0x38, 0x50, 0x3b, 0x86, 0xc7, 0x0d, 0xc5, 0x0b,
-            0x61, 0xc5, 0x8a, 0x77, 0xe4, 0x5c, 0x39, 0xab, 0x25, 0xc0, 0x65, 0x2b, 0xba, 0xa8,
-            0xfa, 0x13, 0x6f, 0x28, 0x51, 0xbd, 0x47, 0x81, 0xc9, 0xdc, 0xde, 0x39, 0xfc, 0x9d,
-            0x1d, 0x52, 0xc9, 0xe6, 0x02, 0x68, 0x06, 0x1e, 0x7d, 0x76, 0x32, 0x17, 0x1d, 0x91,
-            0xaa, 0x8d, 0x46, 0x0a, 0xce, 0xe0, 0xe9, 0x6f, 0x1e, 0x7c, 0x4c, 0xfb, 0x12, 0xd3,
-            0xff, 0x9a, 0xb5, 0xd5, 0xdc, 0x91, 0xc2, 0x77, 0xdb, 0x75, 0xc8, 0x45, 0xd6, 0x49,
-            0xef, 0x3c, 0x4f, 0x63, 0xae, 0xbc, 0x36, 0x4c, 0xd5, 0x5d, 0xed, 0x0c,
-        ];
-
-        let header = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-
-        let expected_signature = [
-            0x83, 0x39, 0xb2, 0x85, 0xa4, 0xac, 0xd8, 0x9d, 0xec, 0x77, 0x77, 0xc0, 0x95, 0x43,
-            0xa4, 0x3e, 0x3c, 0xc6, 0x06, 0x84, 0xb0, 0xa6, 0xf8, 0xab, 0x33, 0x5d, 0xa4, 0x82,
-            0x5c, 0x96, 0xe1, 0x46, 0x3e, 0x28, 0xf8, 0xc5, 0xf4, 0xfd, 0x06, 0x41, 0xd1, 0x9c,
-            0xec, 0x59, 0x20, 0xd3, 0xa8, 0xff, 0x4b, 0xed, 0xb6, 0xc9, 0x69, 0x14, 0x54, 0x59,
-            0x7b, 0xbd, 0x29, 0x82, 0x88, 0xab, 0xed, 0x36, 0x32, 0x07, 0x85, 0x57, 0xb2, 0xac,
-            0xe7, 0xd4, 0x4c, 0xae, 0xd8, 0x46, 0xe1, 0xa0, 0xa1, 0xe8,
-        ];
-
-        let signature = sign(
-            &cs,
-            sk,
-            &pk,
-            Some(&header),
-            &[M1, M2, M3, M4, M5, M6, M7, M8, M9, M10],
-        );
-
-        assert_eq!(signature, expected_signature);
-
-        let result = verify(
+        assert!(proof_verify(
             &cs,
             &pk,
-            &signature,
+            &proof,
             Some(&header),
-            &[M1, M2, M3, M4, M5, M6, M7, M8, M9, M10],
-        );
-
-        assert!(result);
-    }
-
-    #[test]
-    fn bls12_381_sha256_sign_single_message() {
-        let cs = BLS12_381_G1_XMD_SHA_256;
-
-        let msg = [
-            0x98, 0x72, 0xad, 0x08, 0x9e, 0x45, 0x2c, 0x7b, 0x6e, 0x28, 0x3d, 0xfa, 0xc2, 0xa8,
-            0x0d, 0x58, 0xe8, 0xd0, 0xff, 0x71, 0xcc, 0x4d, 0x5e, 0x31, 0x0a, 0x1d, 0xeb, 0xdd,
-            0xa4, 0xa4, 0x5f, 0x02,
-        ];
-
-        let sk = bytes_be_to_scalar(&[
-            0x60, 0xe5, 0x51, 0x10, 0xf7, 0x68, 0x83, 0xa1, 0x3d, 0x03, 0x0b, 0x2f, 0x6b, 0xd1,
-            0x18, 0x83, 0x42, 0x2d, 0x5a, 0xbd, 0xe7, 0x17, 0x56, 0x9f, 0xc0, 0x73, 0x1f, 0x51,
-            0x23, 0x71, 0x69, 0xfc,
-        ]);
-
-        let pk = [
-            0xa8, 0x20, 0xf2, 0x30, 0xf6, 0xae, 0x38, 0x50, 0x3b, 0x86, 0xc7, 0x0d, 0xc5, 0x0b,
-            0x61, 0xc5, 0x8a, 0x77, 0xe4, 0x5c, 0x39, 0xab, 0x25, 0xc0, 0x65, 0x2b, 0xba, 0xa8,
-            0xfa, 0x13, 0x6f, 0x28, 0x51, 0xbd, 0x47, 0x81, 0xc9, 0xdc, 0xde, 0x39, 0xfc, 0x9d,
-            0x1d, 0x52, 0xc9, 0xe6, 0x02, 0x68, 0x06, 0x1e, 0x7d, 0x76, 0x32, 0x17, 0x1d, 0x91,
-            0xaa, 0x8d, 0x46, 0x0a, 0xce, 0xe0, 0xe9, 0x6f, 0x1e, 0x7c, 0x4c, 0xfb, 0x12, 0xd3,
-            0xff, 0x9a, 0xb5, 0xd5, 0xdc, 0x91, 0xc2, 0x77, 0xdb, 0x75, 0xc8, 0x45, 0xd6, 0x49,
-            0xef, 0x3c, 0x4f, 0x63, 0xae, 0xbc, 0x36, 0x4c, 0xd5, 0x5d, 0xed, 0x0c,
-        ];
-
-        let header = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-
-        let expected_signature = [
-            0x84, 0x77, 0x31, 0x60, 0xb8, 0x24, 0xe1, 0x94, 0x07, 0x3a, 0x57, 0x49, 0x3d, 0xac,
-            0x1a, 0x20, 0xb6, 0x67, 0xaf, 0x70, 0xcd, 0x23, 0x52, 0xd8, 0xaf, 0x24, 0x1c, 0x77,
-            0x65, 0x8d, 0xa5, 0x25, 0x3a, 0xa8, 0x45, 0x83, 0x17, 0xcc, 0xa0, 0xea, 0xe6, 0x15,
-            0x69, 0x0d, 0x55, 0xb1, 0xf2, 0x71, 0x64, 0x65, 0x7d, 0xca, 0xfe, 0xe1, 0xd5, 0xc1,
-            0x97, 0x39, 0x47, 0xaa, 0x70, 0xe2, 0xcf, 0xbb, 0x4c, 0x89, 0x23, 0x40, 0xbe, 0x59,
-            0x69, 0x92, 0x0d, 0x09, 0x16, 0x06, 0x7b, 0x45, 0x65, 0xa0,
-        ];
-
-        let signature = sign(&cs, sk, &pk, Some(&header), &[&msg]);
-
-        assert_eq!(signature, expected_signature);
-
-        let result = verify(&cs, &pk, &signature, Some(&header), &[&msg]);
-
-        assert!(result);
+            Some(&ph),
+            Some(&[M1]),
+            Some(vec![0]),
+        ));
     }
 
     #[test]

@@ -10,14 +10,9 @@ All cryptographic operations are implemented in pure Rust with no `unsafe` code 
 
 ### Key Features & Scope
 
-libbbs-rs is still in a very early development stage and purely intended for research at this point. Through the use of Rust with no `unsafe` blocks, memory safety can be relied upon, however the codebase has not yet been tested against any kind of attack vectors.
-Currently implemented are:
-- [x] sign
-- [x] verify
-- [x] proof_gen
-- [ ] proof_verify
+libbbs-rs has reached full compliance with [draft-irtf-cfrg-bbs-signatures-09](https://datatracker.ietf.org/doc/draft-irtf-cfrg-bbs-signatures/). It is still in an early development stafe and breaking changes may still occur frequently. Also it has not yet been optimized for performance or mempry usage. Through the use of Rust with no `unsafe` blocks, memory safety can be relied upon, however the codebase has not yet been tested against any kind of attack vectors.
 
-Upon completion of the basic features, I plan on adding the extension for per-verifier linkability as introduced in [this draft](https://datatracker.ietf.org/doc/draft-irtf-cfrg-bbs-per-verifier-linkability/).
+Currently I am implementing a comprehensive testing suite that covers all the test fixtures and not only the few ones from the rfc. Upon completion of that, I plan on adding the extension for per-verifier linkability as introduced in [this draft](https://datatracker.ietf.org/doc/draft-irtf-cfrg-bbs-per-verifier-linkability/).
 
 ### Core Concepts
 
@@ -57,15 +52,17 @@ $e(A, W + BP_2 \cdot e) \cdot e(B, -BP_2) = I(G_T)$
 - Rust lib [bls12_381](https://docs.rs/bls12_381/latest/bls12_381) for curve operations
 - Rust lib [sha2](https://docs.rs/sha2/latest/sha2/) for hashing, specifially for `expand_message_xmd()`
 - Rust lib [sha3](https://docs.rs/sha3/latest/sha3/) for hashing, specifially for `expand_message_xof()`
-- Rust lib [rand_core](https://docs.rs/rand_core/latest/rand_core/) for hashing, specifially for `generate_random_scalars()`
+- Rust lib [rand_core](https://docs.rs/rand_core/latest/rand_core/) for a source of random values, specifially for `generate_random_scalars()`
 
 No other external cryptographic dependencies are used. As mentioned previously, libbbs-rs does not make use of any `unsafe` code blocks. All used functions from `bls12_381` are constant time.
 Building requires a recent version of rustc: >= 1.90.0
 All unix-style platforms are supported. Windows is not.
 
+The dev dependencies include additional packages for [deserializing json](https://docs.rs/serde_json/latest/serde_json/) and parsing [hex numbers](https://docs.rs/hex/latest/hex/).
+
 ### Testing
 
-All components are tested against the test vectors from the BBS draft. Github's CI is set up to run a build and test on every commit.
+All components are tested against the test vectors from the BBS draft. Github's CI is set up to run a build and test on every commit. Additionaly the comprehensive testing suite including all test fixtures is currently being implemented.
 
 ### License
 
