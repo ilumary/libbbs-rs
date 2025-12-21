@@ -356,9 +356,14 @@ pub fn proof_gen(
         &undisclosed_indexes,
     );
 
+    let disclosed_message_scalars: Vec<Scalar> = disclosed_indexes
+        .iter()
+        .map(|&i| message_scalars[i])
+        .collect();
+
     let challenge = proof_challenge_calculate(
         cs,
-        &message_scalars,
+        &disclosed_message_scalars,
         &disclosed_indexes,
         Some(&api_id),
         ph,
@@ -434,7 +439,7 @@ fn proof_finalize(
 /// initialization of the context, the disclosed_messages, and their indexes.
 fn proof_challenge_calculate(
     cs: &CipherSuite,
-    messages: &[Scalar],
+    disclosed_messages: &[Scalar],
     disclosed_indexes: &[usize],
     api_id: Option<&[u8]>,
     ph: &[u8],
@@ -460,10 +465,13 @@ fn proof_challenge_calculate(
 
     serialize_u64!(c_octs, off, r);
 
-    disclosed_indexes.iter().for_each(|&di| {
-        serialize_u64!(c_octs, off, di);
-        serialize_scalar!(c_octs, off, messages[di]);
-    });
+    disclosed_indexes
+        .iter()
+        .zip(disclosed_messages.iter())
+        .for_each(|(&di, &msg)| {
+            serialize_u64!(c_octs, off, di);
+            serialize_scalar!(c_octs, off, msg);
+        });
 
     serialize_g1!(c_octs, off, ir.g1[0]);
     serialize_g1!(c_octs, off, ir.g1[1]);
@@ -506,6 +514,8 @@ fn proof_init(
         .iter()
         .zip(message_scalars.iter())
         .fold(p_1 + q_1 * domain, |acc: G1Projective, (h, m)| acc + h * m);
+
+    // OPTIONAL could verify signature using pk and header here
 
     let r1 = &random_scalars[0]; // r1
     let r2 = &random_scalars[1]; // r2
@@ -556,6 +566,7 @@ pub fn verify(
         l + 1 == generators.len(),
         "generators and messages dont match"
     );
+
     let q_1 = generators[0];
     let h = &generators[1..];
 
@@ -937,6 +948,360 @@ mod tests {
         );
     }
 
+    #[derive(Deserialize)]
+    struct RandomScalars {
+        r1: String,
+        r2: String,
+        e_tilde: String,
+        r1_tilde: String,
+        r3_tilde: String,
+        m_tilde_scalars: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct ProofTraceRaw {
+        random_scalars: RandomScalars,
+        A_bar: String,
+        B_bar: String,
+        D: String,
+        T1: String,
+        T2: String,
+        domain: String,
+        challenge: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ProofTestVector {
+        case_name: String,
+        signer_public_key: String,
+        signature: String,
+        header: String,
+        presentation_header: String,
+        messages: Vec<String>,
+        disclosed_indexes: Vec<usize>,
+        proof: String,
+        result: TestResult,
+        trace: ProofTraceRaw,
+    }
+
+    struct ProofTrace {
+        random_scalars: Vec<Scalar>,
+        abar: G1Affine,
+        bbar: G1Affine,
+        d: G1Affine,
+        t1: G1Affine,
+        t2: G1Affine,
+        domain: Scalar,
+        challenge: Scalar,
+    }
+
+    fn get_random_scalars(ptv: &ProofTestVector) -> Vec<String> {
+        let rs = &ptv.trace.random_scalars;
+        let mut scalars = vec![
+            rs.r1.clone(),
+            rs.r2.clone(),
+            rs.e_tilde.clone(),
+            rs.r1_tilde.clone(),
+            rs.r3_tilde.clone(),
+        ];
+        scalars.extend(rs.m_tilde_scalars.iter().cloned());
+        scalars
+    }
+
+    fn run_proof_test<G, V>(path: &Path, proof_gen_fn: G, proof_verify_fn: V)
+    where
+        // G: (pk, proof, sig, header, ph, msgs, disclosed_msgs, disclosed_idxs, proof_trace) -> bool
+        G: Fn(
+            &[u8],
+            &[u8],
+            &mut [u8],
+            Option<&[u8]>,
+            Option<&[u8]>,
+            &[&[u8]],
+            Option<Vec<usize>>,
+            &ProofTrace,
+        ) -> bool,
+        // V: (pk, proof, header, ph, disclosed_msgs, disclosed_idxs)
+        V: Fn(
+            &[u8],
+            &[u8],
+            Option<&[u8]>,
+            Option<&[u8]>,
+            Option<&[&[u8]]>,
+            Option<Vec<usize>>,
+        ) -> bool,
+    {
+        let json_content = fs::read_to_string(path).unwrap();
+        let vector: ProofTestVector = serde_json::from_str(&json_content).unwrap();
+
+        println!("testing {}", vector.case_name);
+
+        let pk_bytes = hex::decode(&vector.signer_public_key).unwrap();
+        let mut sig_bytes = hex::decode(&vector.signature).unwrap();
+        let expected_proof = hex::decode(&vector.proof).unwrap();
+        let header = hex::decode(&vector.header).unwrap();
+        let ph = hex::decode(&vector.presentation_header).unwrap();
+
+        let msg_data: Vec<Vec<u8>> = vector
+            .messages
+            .iter()
+            .map(|m| hex::decode(m).unwrap())
+            .collect();
+
+        let msg_slices: Vec<&[u8]> = msg_data.iter().map(|m| m.as_slice()).collect();
+
+        // trace stuff
+        let mut pt: ProofTrace = ProofTrace {
+            random_scalars: Vec::new(),
+            abar: G1Affine::from_compressed(
+                &hex::decode(&vector.trace.A_bar)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap(),
+            bbar: G1Affine::from_compressed(
+                &hex::decode(&vector.trace.B_bar)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap(),
+            d: G1Affine::from_compressed(
+                &hex::decode(&vector.trace.D).unwrap().try_into().unwrap(),
+            )
+            .unwrap(),
+            t1: G1Affine::from_compressed(
+                &hex::decode(&vector.trace.T1).unwrap().try_into().unwrap(),
+            )
+            .unwrap(),
+            t2: G1Affine::from_compressed(
+                &hex::decode(&vector.trace.T2).unwrap().try_into().unwrap(),
+            )
+            .unwrap(),
+            domain: bytes_be_to_scalar(
+                &hex::decode(&vector.trace.domain)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            challenge: bytes_be_to_scalar(
+                &hex::decode(&vector.trace.challenge)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+        };
+
+        let scalar_data: Vec<Vec<u8>> = get_random_scalars(&vector)
+            .iter()
+            .map(|s| hex::decode(s).expect("invalid scalar hex"))
+            .collect();
+
+        for raw_scalar in scalar_data {
+            pt.random_scalars
+                .push(bytes_be_to_scalar(&raw_scalar.try_into().unwrap()));
+        }
+
+        if vector.result.valid {
+            assert!(
+                proof_gen_fn(
+                    &pk_bytes,
+                    &expected_proof,
+                    &mut sig_bytes,
+                    Some(&header),
+                    Some(&ph),
+                    &msg_slices,
+                    Some(vector.disclosed_indexes.clone()),
+                    &pt,
+                ),
+                "failed proof gen in test case: {}",
+                vector.case_name
+            );
+        }
+
+        let disclosed_messages: Vec<&[u8]> = vector
+            .disclosed_indexes
+            .iter()
+            .map(|&i| msg_slices[i])
+            .collect();
+
+        assert_eq!(
+            proof_verify_fn(
+                &pk_bytes,
+                &expected_proof,
+                Some(&header),
+                Some(&ph),
+                Some(&disclosed_messages),
+                Some(vector.disclosed_indexes)
+            ),
+            vector.result.valid,
+            "failed proof verify in test case {}",
+            vector.case_name
+        );
+    }
+
+    fn run_all_proof_vectors<G, V>(dir: &str, proof_gen_fn: G, proof_verify_fn: V)
+    where
+        // G: (pk, proof, sig, header, ph, msgs, disclosed_msgs, disclosed_idxs, proof_trace) -> bool
+        G: Fn(
+                &[u8],
+                &[u8],
+                &mut [u8],
+                Option<&[u8]>,
+                Option<&[u8]>,
+                &[&[u8]],
+                Option<Vec<usize>>,
+                &ProofTrace,
+            ) -> bool
+            + Copy,
+        // V: (pk, proof, header, ph, disclosed_msgs, disclosed_idxs)
+        V: Fn(
+                &[u8],
+                &[u8],
+                Option<&[u8]>,
+                Option<&[u8]>,
+                Option<&[&[u8]]>,
+                Option<Vec<usize>>,
+            ) -> bool
+            + Copy,
+    {
+        let paths = fs::read_dir(dir).unwrap();
+        for entry in paths {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                run_proof_test(&path, proof_gen_fn, proof_verify_fn);
+            }
+        }
+    }
+
+    fn test_proof_gen(
+        cs: &CipherSuite,
+        pk: &[u8],
+        expected_proof: &[u8],
+        sig: &mut [u8],
+        header: Option<&[u8]>,
+        ph: Option<&[u8]>,
+        msgs: &[&[u8]],
+        disclosed_indexes: Option<Vec<usize>>,
+        pt: &ProofTrace,
+    ) -> bool {
+        let api_id = [cs.api_id, b"H2G_HM2S_"].concat();
+        let disclosed_indexes = disclosed_indexes.unwrap_or_default();
+
+        let message_scalars = messages_to_scalars(cs, msgs, Some(&api_id));
+        let generators = create_generators(cs, msgs.len() + 1, Some(&api_id));
+
+        let (a, e) = octets_to_signature(sig);
+
+        let l = msgs.len();
+
+        for &i in disclosed_indexes.iter() {
+            assert!(i < l, "disclosed indexes out of bounds");
+        }
+
+        let undisclosed_indexes = (0..l)
+            .filter(|i| !disclosed_indexes.contains(i))
+            .collect::<Vec<usize>>();
+
+        let init_res = proof_init(
+            cs,
+            pk,
+            (&a, &e),
+            header,
+            Some(&api_id),
+            &generators,
+            &message_scalars,
+            &pt.random_scalars,
+            &undisclosed_indexes,
+        );
+
+        assert_eq!(init_res.g1[0], pt.abar);
+        assert_eq!(init_res.g1[1], pt.bbar);
+        assert_eq!(init_res.g1[2], pt.d);
+        assert_eq!(init_res.g1[3], pt.t1);
+        assert_eq!(init_res.g1[4], pt.t2);
+        assert_eq!(init_res.sc, pt.domain);
+
+        let disclosed_message_scalars: Vec<Scalar> = disclosed_indexes
+            .iter()
+            .map(|&i| message_scalars[i])
+            .collect();
+
+        let challenge = proof_challenge_calculate(
+            cs,
+            &disclosed_message_scalars,
+            &disclosed_indexes,
+            Some(&api_id),
+            ph.unwrap_or_default(),
+            &init_res,
+        );
+
+        assert_eq!(challenge, pt.challenge);
+
+        let proof = proof_finalize(
+            &pt.random_scalars,
+            &message_scalars,
+            &undisclosed_indexes,
+            &init_res.g1[0],
+            &init_res.g1[1],
+            &init_res.g1[2],
+            &e,
+            &challenge,
+        );
+
+        assert_eq!(proof.as_ref(), expected_proof);
+
+        true
+    }
+
+    #[test]
+    fn bls12_381_sha_256_proofs() {
+        run_all_proof_vectors(
+            "./test_fixtures/bls12-381-sha-256/proof",
+            |pk, expected_proof, sig, header, ph, msgs, idxs, pt| {
+                let cs = &BLS12_381_G1_XMD_SHA_256;
+                test_proof_gen(cs, pk, expected_proof, sig, header, ph, msgs, idxs, pt)
+            },
+            |pk, proof, header, ph, disclosed_messages, disclosed_indexes| {
+                let cs = &BLS12_381_G1_XMD_SHA_256;
+                proof_verify(
+                    cs,
+                    pk,
+                    proof,
+                    header,
+                    ph,
+                    disclosed_messages,
+                    disclosed_indexes,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn bls12_381_shake_256_proofs() {
+        run_all_proof_vectors(
+            "./test_fixtures/bls12-381-shake-256/proof",
+            |pk, expected_proof, sig, header, ph, msgs, idxs, pt| {
+                let cs = &BLS12_381_G1_XOF_SHAKE_256;
+                test_proof_gen(cs, pk, expected_proof, sig, header, ph, msgs, idxs, pt)
+            },
+            |pk, proof, header, ph, disclosed_messages, disclosed_indexes| {
+                let cs = &BLS12_381_G1_XOF_SHAKE_256;
+                proof_verify(
+                    cs,
+                    pk,
+                    proof,
+                    header,
+                    ph,
+                    disclosed_messages,
+                    disclosed_indexes,
+                )
+            },
+        );
+    }
+
     pub const M1: &[u8] = &[
         0x98, 0x72, 0xad, 0x08, 0x9e, 0x45, 0x2c, 0x7b, 0x6e, 0x28, 0x3d, 0xfa, 0xc2, 0xa8, 0x0d,
         0x58, 0xe8, 0xd0, 0xff, 0x71, 0xcc, 0x4d, 0x5e, 0x31, 0x0a, 0x1d, 0xeb, 0xdd, 0xa4, 0xa4,
@@ -989,188 +1354,6 @@ mod tests {
         println!("Q2: {:x?}", gens[0].to_compressed());
         let res = gens[0] * scal;
         println!("RES: {:x?}", G1Affine::from(res).to_compressed());
-    }
-
-    #[test]
-    fn bls12_381_sha256_valid_multi_message_some_messages_disclosed_proof() {}
-
-    #[test]
-    fn bls12_381_sha256_valid_multi_message_proof_all_messages_disclosed() {}
-
-    #[test]
-    fn bls12_381_sha256_valid_single_message_proof() {
-        let cs = BLS12_381_G1_XMD_SHA_256;
-
-        let pk = [
-            0xa8, 0x20, 0xf2, 0x30, 0xf6, 0xae, 0x38, 0x50, 0x3b, 0x86, 0xc7, 0x0d, 0xc5, 0x0b,
-            0x61, 0xc5, 0x8a, 0x77, 0xe4, 0x5c, 0x39, 0xab, 0x25, 0xc0, 0x65, 0x2b, 0xba, 0xa8,
-            0xfa, 0x13, 0x6f, 0x28, 0x51, 0xbd, 0x47, 0x81, 0xc9, 0xdc, 0xde, 0x39, 0xfc, 0x9d,
-            0x1d, 0x52, 0xc9, 0xe6, 0x02, 0x68, 0x06, 0x1e, 0x7d, 0x76, 0x32, 0x17, 0x1d, 0x91,
-            0xaa, 0x8d, 0x46, 0x0a, 0xce, 0xe0, 0xe9, 0x6f, 0x1e, 0x7c, 0x4c, 0xfb, 0x12, 0xd3,
-            0xff, 0x9a, 0xb5, 0xd5, 0xdc, 0x91, 0xc2, 0x77, 0xdb, 0x75, 0xc8, 0x45, 0xd6, 0x49,
-            0xef, 0x3c, 0x4f, 0x63, 0xae, 0xbc, 0x36, 0x4c, 0xd5, 0x5d, 0xed, 0x0c,
-        ];
-
-        let header = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-
-        let signature = [
-            0x84, 0x77, 0x31, 0x60, 0xb8, 0x24, 0xe1, 0x94, 0x07, 0x3a, 0x57, 0x49, 0x3d, 0xac,
-            0x1a, 0x20, 0xb6, 0x67, 0xaf, 0x70, 0xcd, 0x23, 0x52, 0xd8, 0xaf, 0x24, 0x1c, 0x77,
-            0x65, 0x8d, 0xa5, 0x25, 0x3a, 0xa8, 0x45, 0x83, 0x17, 0xcc, 0xa0, 0xea, 0xe6, 0x15,
-            0x69, 0x0d, 0x55, 0xb1, 0xf2, 0x71, 0x64, 0x65, 0x7d, 0xca, 0xfe, 0xe1, 0xd5, 0xc1,
-            0x97, 0x39, 0x47, 0xaa, 0x70, 0xe2, 0xcf, 0xbb, 0x4c, 0x89, 0x23, 0x40, 0xbe, 0x59,
-            0x69, 0x92, 0x0d, 0x09, 0x16, 0x06, 0x7b, 0x45, 0x65, 0xa0,
-        ];
-
-        let ph = [
-            0xbe, 0xd2, 0x31, 0xd8, 0x80, 0x67, 0x5e, 0xd1, 0x01, 0xea, 0xd3, 0x04, 0x51, 0x2e,
-            0x04, 0x3a, 0xde, 0x99, 0x58, 0xdd, 0x02, 0x41, 0xea, 0x70, 0xb4, 0xb3, 0x95, 0x7f,
-            0xba, 0x94, 0x15, 0x01,
-        ];
-
-        let disclosed_indexes = [0];
-
-        let random_scalars = [
-            bytes_be_to_scalar(&[
-                0x60, 0xca, 0x40, 0x9f, 0x6b, 0x05, 0x63, 0xf6, 0x87, 0xfc, 0x47, 0x1c, 0x63, 0xd2,
-                0x81, 0x9f, 0x44, 0x6f, 0x39, 0xc2, 0x3b, 0xb5, 0x40, 0x92, 0x5d, 0x9d, 0x42, 0x54,
-                0xac, 0x58, 0xf3, 0x37,
-            ]),
-            bytes_be_to_scalar(&[
-                0x2c, 0xef, 0xf4, 0x98, 0x2d, 0xe0, 0xc9, 0x13, 0x09, 0x0f, 0x75, 0xf0, 0x81, 0xdf,
-                0x5e, 0xc5, 0x94, 0xc3, 0x10, 0xbb, 0x48, 0xc1, 0x7c, 0xfd, 0xaa, 0xb5, 0x33, 0x2a,
-                0x68, 0x2e, 0xf8, 0x11,
-            ]),
-            bytes_be_to_scalar(&[
-                0x61, 0x01, 0xc4, 0x40, 0x48, 0x95, 0xf3, 0xdf, 0xf8, 0x7a, 0xb3, 0x9c, 0x34, 0xcb,
-                0x99, 0x5a, 0xf0, 0x7e, 0x71, 0x39, 0xe6, 0xb3, 0x84, 0x71, 0x80, 0xff, 0xdd, 0x1b,
-                0xc8, 0xc3, 0x13, 0xcd,
-            ]),
-            bytes_be_to_scalar(&[
-                0x0d, 0xfc, 0xff, 0xd9, 0x7a, 0x6e, 0xcd, 0xeb, 0xef, 0x3c, 0x9c, 0x11, 0x4b, 0x99,
-                0xd7, 0xa0, 0x30, 0xc9, 0x98, 0xd9, 0x38, 0x90, 0x5f, 0x35, 0x7d, 0xf6, 0x28, 0x22,
-                0xde, 0xe0, 0x72, 0xe8,
-            ]),
-            bytes_be_to_scalar(&[
-                0x63, 0x9e, 0x34, 0x17, 0x00, 0x7d, 0x38, 0xe5, 0xd3, 0x4b, 0xa8, 0xc5, 0x11, 0xe8,
-                0x36, 0x76, 0x8d, 0xdc, 0x26, 0x69, 0xfd, 0xd3, 0xfa, 0xff, 0x5c, 0x14, 0xad, 0x27,
-                0xac, 0x2b, 0x2d, 0xa1,
-            ]),
-        ];
-
-        let messages = &[M1];
-
-        let api_id = [cs.api_id, b"H2G_HM2S_"].concat();
-
-        let message_scalars = messages_to_scalars(&cs, messages, Some(&api_id));
-        let generators = create_generators(&cs, messages.len() + 1, Some(&api_id));
-
-        let (a, e) = octets_to_signature(&signature);
-
-        let l = messages.len();
-
-        for &i in disclosed_indexes.iter() {
-            assert!(i < l, "disclosed indexes out of bounds");
-        }
-
-        let undisclosed_indexes = (0..l)
-            .filter(|i| !disclosed_indexes.contains(i))
-            .collect::<Vec<usize>>();
-
-        let init_res = proof_init(
-            &cs,
-            &pk,
-            (&a, &e),
-            Some(&header),
-            Some(&api_id),
-            &generators,
-            &message_scalars,
-            &random_scalars,
-            &undisclosed_indexes,
-        );
-
-        let expected_t1 = G1Affine::from_compressed(&[
-            0xa8, 0x62, 0xfa, 0x5d, 0x3a, 0xb4, 0xc2, 0x64, 0xc2, 0x2b, 0x8a, 0x02, 0x63, 0x6f,
-            0xd4, 0x03, 0x0e, 0x8b, 0x14, 0xac, 0x20, 0xde, 0xe1, 0x4e, 0x08, 0xfd, 0xb6, 0xcf,
-            0xc4, 0x45, 0x43, 0x2c, 0x08, 0xab, 0xb4, 0x9e, 0xc1, 0x11, 0xc1, 0xeb, 0x9d, 0x90,
-            0xab, 0xef, 0x50, 0x13, 0x4a, 0x60,
-        ])
-        .unwrap();
-        let expected_t2 = G1Affine::from_compressed(&[
-            0xab, 0x95, 0x43, 0xa6, 0xb0, 0x43, 0x03, 0xe9, 0x97, 0x62, 0x1d, 0x3d, 0x5c, 0xbd,
-            0x85, 0x92, 0x4e, 0x7e, 0x69, 0xda, 0x49, 0x8a, 0x2a, 0x9e, 0x9d, 0x3a, 0x8b, 0x01,
-            0xf3, 0x92, 0x59, 0xc9, 0xc5, 0x92, 0x0b, 0xd5, 0x30, 0xde, 0x1d, 0x3b, 0x0a, 0xfb,
-            0x99, 0xeb, 0x0c, 0x54, 0x9d, 0x5a,
-        ])
-        .unwrap();
-        let expected_domain = bytes_be_to_scalar(&[
-            0x25, 0xd5, 0x7f, 0xab, 0x92, 0xa8, 0x27, 0x4c, 0x68, 0xfd, 0xe5, 0xc3, 0xf1, 0x6d,
-            0x4b, 0x27, 0x5e, 0x4a, 0x15, 0x6f, 0x21, 0x1a, 0xe3, 0x4b, 0x3a, 0xb3, 0x2f, 0xba,
-            0xf5, 0x06, 0xed, 0x5c,
-        ]);
-
-        let challenge = proof_challenge_calculate(
-            &cs,
-            &message_scalars,
-            &disclosed_indexes,
-            Some(&api_id),
-            &ph,
-            &init_res,
-        );
-
-        assert_eq!(init_res.sc, expected_domain);
-        assert_eq!(init_res.g1[3], expected_t1);
-        assert_eq!(init_res.g1[4], expected_t2);
-
-        // proof finalize
-        let proof = proof_finalize(
-            &random_scalars,
-            &message_scalars,
-            &undisclosed_indexes,
-            &init_res.g1[0],
-            &init_res.g1[1],
-            &init_res.g1[2],
-            &e,
-            &challenge,
-        );
-
-        let expected_proof = [
-            0x94, 0x91, 0x62, 0x92, 0xa7, 0xa6, 0xba, 0xde, 0x28, 0x45, 0x6c, 0x60, 0x1d, 0x3a,
-            0xf3, 0x3f, 0xcf, 0x39, 0x27, 0x8d, 0x65, 0x94, 0xb4, 0x67, 0xe1, 0x28, 0xa3, 0xf8,
-            0x36, 0x86, 0xa1, 0x04, 0xef, 0x2b, 0x2f, 0xcf, 0x72, 0xdf, 0x02, 0x15, 0xee, 0xaf,
-            0x69, 0x26, 0x2f, 0xfe, 0x81, 0x94, 0xa1, 0x9f, 0xab, 0x31, 0xa8, 0x2d, 0xdb, 0xe0,
-            0x69, 0x08, 0x98, 0x5a, 0xbc, 0x4c, 0x98, 0x25, 0x78, 0x8b, 0x8a, 0x16, 0x10, 0x94,
-            0x2d, 0x12, 0xb7, 0xf5, 0xde, 0xbb, 0xea, 0x89, 0x85, 0x29, 0x63, 0x61, 0x20, 0x6d,
-            0xba, 0xce, 0x7a, 0xf0, 0xcc, 0x83, 0x4c, 0x80, 0xf3, 0x3e, 0x0a, 0xad, 0xae, 0xea,
-            0x55, 0x97, 0xbe, 0xfb, 0xb6, 0x51, 0x82, 0x7b, 0x5e, 0xed, 0x5a, 0x66, 0xf1, 0xa9,
-            0x59, 0xbb, 0x46, 0xcf, 0xd5, 0xca, 0x1a, 0x81, 0x7a, 0x14, 0x47, 0x59, 0x60, 0xf6,
-            0x9b, 0x32, 0xc5, 0x4d, 0xb7, 0x58, 0x7b, 0x5e, 0xe3, 0xab, 0x66, 0x5f, 0xbd, 0x37,
-            0xb5, 0x06, 0x83, 0x0a, 0x49, 0xf2, 0x1d, 0x59, 0x2f, 0x5e, 0x63, 0x4f, 0x47, 0xce,
-            0xe0, 0x5a, 0x02, 0x5a, 0x2f, 0x8f, 0x94, 0xe7, 0x3a, 0x6c, 0x15, 0xf0, 0x23, 0x01,
-            0xd1, 0x17, 0x8a, 0x92, 0x87, 0x3b, 0x6e, 0x86, 0x34, 0xba, 0xfe, 0x49, 0x83, 0xc3,
-            0xe1, 0x5a, 0x66, 0x3d, 0x64, 0x08, 0x06, 0x78, 0xdb, 0xf2, 0x94, 0x17, 0x51, 0x9b,
-            0x78, 0xaf, 0x04, 0x2b, 0xe2, 0xb3, 0xe1, 0xc4, 0xd0, 0x8b, 0x8d, 0x52, 0x0f, 0xfa,
-            0xb0, 0x08, 0xcb, 0xaa, 0xca, 0x56, 0x71, 0xa1, 0x5b, 0x22, 0xc2, 0x39, 0xb3, 0x8e,
-            0x94, 0x0c, 0xfe, 0xaa, 0x5e, 0x72, 0x10, 0x45, 0x76, 0xa9, 0xec, 0x4a, 0x6f, 0xad,
-            0x78, 0xc5, 0x32, 0x38, 0x1a, 0xea, 0xa6, 0xfb, 0x56, 0x40, 0x9c, 0xef, 0x56, 0xee,
-            0x5c, 0x14, 0x0d, 0x45, 0x5f, 0xee, 0xb0, 0x44, 0x26, 0x19, 0x3c, 0x57, 0x08, 0x6c,
-            0x9b, 0x6d, 0x39, 0x7d, 0x94, 0x18,
-        ];
-
-        assert_eq!(*proof, expected_proof);
-
-        assert!(proof_verify(
-            &cs,
-            &pk,
-            &proof,
-            Some(&header),
-            Some(&ph),
-            Some(&[M1]),
-            Some(vec![0]),
-        ));
     }
 
     #[test]
